@@ -1,0 +1,205 @@
+// PROJ3CTX — Site Cloner
+// local : node app.js   ->  http://127.0.0.1:3000
+// render: Start Command = node app.js
+const http = require('http');
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = +process.env.PORT || 3000;
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+const TIMEOUT = 25000;
+
+// ---------- UI (อ่านจาก ui.html; ถ้าไม่มีใช้หน้า fallback) ----------
+let UI;
+try {
+  UI = fs.readFileSync(path.join(__dirname, 'ui.html'), 'utf8');
+} catch (e) {
+  UI = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>PROJ3CTX</title></head>'
+     + '<body style="font-family:system-ui;background:#050608;color:#e8ecf6;padding:40px">'
+     + '<h1>PROJ3CTX</h1><p style="color:#ff5c6c">ไม่พบไฟล์ ui.html ในโปรเจกต์</p></body></html>';
+  console.log('  [warn] ไม่พบ ui.html -> ใช้หน้า fallback');
+}
+
+// ---------- fetch helper ----------
+async function grab(u, bin) {
+  const ctl = new AbortController();
+  const t = setTimeout(function () { ctl.abort(); }, TIMEOUT);
+  try {
+    const r = await fetch(u, {
+      redirect: 'follow',
+      signal: ctl.signal,
+      headers: {
+        'user-agent': UA,
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'th,en-US;q=0.9,en;q=0.8'
+      }
+    });
+    const buf = Buffer.from(await r.arrayBuffer());
+    return {
+      code: r.status,
+      type: r.headers.get('content-type') || '',
+      url: r.url || u,
+      body: bin ? buf : buf.toString('utf8')
+    };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+const A = (u, b) => { try { return new URL(u, b).href; } catch (e) { return null; } };
+
+const css = (t, b) => t.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, q, u) => {
+  if (/^(data:|#|https?:|\/\/)/i.test(u)) return m;
+  const a = A(u, b);
+  return a ? 'url("' + a + '")' : m;
+});
+
+// ---------- converter ----------
+async function conv(h, base, o) {
+  let out = h;
+  const st = { css: 0, img: 0, fail: 0 };
+
+  if (o.strip) {
+    out = out.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+             .replace(/<link\b[^>]*rel=["']?(preload|modulepreload|prefetch)["']?[^>]*>/gi, '')
+             .replace(/\son[a-z]{3,}\s*=\s*["'][^"']*["']/gi, '');
+  }
+
+  if (o.assets) {
+    // external stylesheets -> <style>
+    for (const tag of out.match(/<link\b[^>]*stylesheet[^>]*>/gi) || []) {
+      const hh = (tag.match(/href=["']([^"']+)["']/i) || [])[1];
+      const a = hh && A(hh, base);
+      if (!a) continue;
+      try {
+        const r = await grab(a, true);
+        if (r.code >= 400) throw 0;
+        out = out.split(tag).join('<style>' + css(r.body.toString(), a) + '</style>');
+        st.css++;
+      } catch (e) { st.fail++; }
+    }
+
+    // images
+    const re = /(<img[^>]+src=["'])([^"']+)/gi;
+    const hits = [];
+    let m;
+    while ((m = re.exec(out)) !== null) hits.push([m[0], m[2]]);
+    for (const [t, u] of hits) {
+      if (/^data:/i.test(u)) continue;
+      const a = A(u, base);
+      if (!a) continue;
+      if (o.inline) {
+        try {
+          const r = await grab(a, true);
+          if (r.code >= 400) throw 0;
+          const mt = r.type.split(';')[0] || 'image/png';
+          out = out.split(t).join(t.replace(u, 'data:' + mt + ';base64,' + r.body.toString('base64')));
+          st.img++;
+        } catch (e) { st.fail++; }
+      } else {
+        out = out.split(t).join(t.replace(u, a));
+      }
+    }
+  }
+
+  if (o.rewrite) {
+    out = out.replace(/(href|src)=["']([^"']+)["']/gi, (m, at, u) => {
+      if (/^(data:|#|https?:|\/\/|javascript:|mailto:|tel:)/i.test(u)) return m;
+      const a = A(u, base);
+      return a ? at + '="' + a + '"' : m;
+    });
+  }
+
+  if (!/<base\b/i.test(out)) out = out.replace(/<head[^>]*>/i, '$&<base href="' + base + '">');
+
+  return { html: out, stats: st };
+}
+
+// ---------- json helper ----------
+function j(res, code, obj) {
+  const s = JSON.stringify(obj);
+  res.writeHead(code, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(s),
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*'
+  });
+  res.end(s);
+}
+
+// ---------- server ----------
+const server = http.createServer(async function (req, res) {
+  const u = new URL(req.url, 'http://x');
+
+  if (u.pathname === '/' || u.pathname === '/index.html') {
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store'
+    });
+    return res.end(UI);
+  }
+
+  if (u.pathname === '/ping' || u.pathname === '/healthz') {
+    return j(res, 200, { ok: true, time: new Date().toISOString(), uptime: process.uptime() });
+  }
+
+  if (u.pathname !== '/clone') return j(res, 404, { success: false, error: 'ไม่พบ path นี้' });
+
+  let target = u.searchParams.get('url') || '';
+  if (!/^https?:\/\//i.test(target)) target = 'https://' + target;
+
+  const o = {
+    assets:  u.searchParams.get('assets')  === '1',
+    inline:  u.searchParams.get('inline')  === '1',
+    rewrite: u.searchParams.get('rewrite') === '1',
+    strip:   u.searchParams.get('strip')   === '1'
+  };
+
+  try {
+    const r = await grab(target, false);
+    if (r.code >= 400) return j(res, 200, { success: false, error: 'เว็บตอบกลับ HTTP ' + r.code });
+
+    let html = r.body;
+    const base = r.url;
+    if (o.assets || o.rewrite) {
+      const c = await conv(html, base, o);
+      html = c.html;
+      return j(res, 200, {
+        success: true, url: base, html: html,
+        size: Buffer.byteLength(html), stats: c.stats
+      });
+    }
+    return j(res, 200, {
+      success: true, url: base, html: html,
+      size: Buffer.byteLength(html), stats: { css: 0, img: 0, fail: 0 }
+    });
+  } catch (e) {
+    const m = e.name === 'AbortError' ? 'หมดเวลา (timeout) เว็บปลายทางตอบช้าเกินไป' : (e.message || String(e));
+    return j(res, 200, { success: false, error: m });
+  }
+});
+
+server.listen(PORT, '0.0.0.0', function () {
+  const nets = os.networkInterfaces();
+  let lan = '';
+  for (const k of Object.keys(nets)) {
+    for (const n of nets[k]) if (n.family === 'IPv4' && !n.internal) lan = n.address;
+  }
+  console.log('');
+  console.log('  PROJ3CTX — Site Cloner');
+  console.log('  local: http://127.0.0.1:' + PORT);
+  if (lan) console.log('  LAN  : http://' + lan + ':' + PORT);
+  console.log('  ping : /ping');
+  console.log('  node : ' + process.version);
+  console.log('');
+});
+
+server.on('error', function (e) {
+  if (e.code === 'EADDRINUSE') {
+    console.log('  พอร์ต ' + PORT + ' ถูกใช้อยู่ -> ลอง: PORT=3001 node app.js');
+  } else {
+    console.log('  เปิดเซิร์ฟเวอร์ไม่ได้: ' + e.message);
+  }
+  process.exit(1);
+});
